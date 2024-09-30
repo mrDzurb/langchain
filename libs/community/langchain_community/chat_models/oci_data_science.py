@@ -11,6 +11,8 @@ from typing import (
     Optional,
     Type,
     Union,
+    Sequence,
+    Callable,
 )
 
 from langchain_core.callbacks import (
@@ -24,20 +26,17 @@ from langchain_core.language_models.chat_models import (
     generate_from_stream,
 )
 from langchain_core.messages import AIMessageChunk, BaseMessage, BaseMessageChunk
+from langchain_core.tools import BaseTool
 from langchain_core.output_parsers import (
     JsonOutputParser,
     PydanticOutputParser,
 )
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
-from langchain_core.pydantic_v1 import BaseModel, Field
 from langchain_core.runnables import Runnable, RunnableMap, RunnablePassthrough
+from langchain_core.utils.function_calling import convert_to_openai_tool
 
-from langchain_community.adapters.openai import (
-    convert_dict_to_message,
-    convert_message_to_dict,
-)
-from langchain_community.chat_models.openai import _convert_delta_to_message_chunk
-from langchain_community.llms.oci_data_science_model_deployment_endpoint import (
+from pydantic import BaseModel, Field
+from ads.llm.langchain.plugins.llms.oci_data_science_model_deployment_endpoint import (
     DEFAULT_MODEL_NAME,
     BaseOCIModelDeployment,
 )
@@ -128,8 +127,7 @@ class ChatOCIModelDeployment(BaseChatModel, BaseOCIModelDeployment):
         .. code-block:: python
 
             from typing import Optional
-
-            from langchain_core.pydantic_v1 import BaseModel, Field
+            from pydantic import BaseModel, Field
 
             class Joke(BaseModel):
                 setup: str = Field(description="The setup of the joke")
@@ -148,7 +146,7 @@ class ChatOCIModelDeployment(BaseChatModel, BaseOCIModelDeployment):
 
     Customized Usage:
 
-    You can inherit from base class and overrwrite the `_process_response`, `_process_stream_response`,
+    You can inherit from base class and overwrite the `_process_response`, `_process_stream_response`,
     `_construct_json_body` for satisfying customized needed.
 
         .. code-block:: python
@@ -187,6 +185,20 @@ class ChatOCIModelDeployment(BaseChatModel, BaseOCIModelDeployment):
     stop: Optional[List[str]] = None
     """Stop words to use when generating. Model output is cut off
     at the first occurrence of any of these substrings."""
+
+    @pre_init
+    def validate_environment(  # pylint: disable=no-self-argument
+        cls, values: Dict
+    ) -> Dict:
+        try:
+            import langchain_openai
+
+        except ImportError as ex:
+            raise ImportError(
+                "Could not import langchain_openai package. "
+                "Please install it with `pip install langchain_openai`."
+            ) from ex
+        return values
 
     @property
     def _llm_type(self) -> str:
@@ -542,8 +554,10 @@ class ChatOCIModelDeployment(BaseChatModel, BaseOCIModelDeployment):
                 converted messages and additional parameters.
 
         """
+        from langchain_openai.chat_models.base import _convert_message_to_dict
+
         return {
-            "messages": [convert_message_to_dict(m) for m in messages],
+            "messages": [_convert_message_to_dict(m) for m in messages],
             **params,
         }
 
@@ -568,6 +582,8 @@ class ChatOCIModelDeployment(BaseChatModel, BaseOCIModelDeployment):
             ValueError: If the response JSON is not well-formed or does not
                 contain the expected structure.
         """
+        from langchain_openai.chat_models.base import _convert_delta_to_message_chunk
+
         try:
             choice = response_json["choices"][0]
             if not isinstance(choice, dict):
@@ -606,6 +622,8 @@ class ChatOCIModelDeployment(BaseChatModel, BaseOCIModelDeployment):
             contain the expected structure.
 
         """
+        from langchain_openai.chat_models.base import _convert_dict_to_message
+
         generations = []
         try:
             choices = response_json["choices"]
@@ -617,7 +635,7 @@ class ChatOCIModelDeployment(BaseChatModel, BaseOCIModelDeployment):
             ) from e
 
         for choice in choices:
-            message = convert_dict_to_message(choice["message"])
+            message = _convert_dict_to_message(choice["message"])
             generation_info = dict(finish_reason=choice.get("finish_reason"))
             if "logprobs" in choice:
                 generation_info["logprobs"] = choice["logprobs"]
@@ -635,6 +653,14 @@ class ChatOCIModelDeployment(BaseChatModel, BaseOCIModelDeployment):
             "system_fingerprint": response_json.get("system_fingerprint", ""),
         }
         return ChatResult(generations=generations, llm_output=llm_output)
+
+    def bind_tools(
+        self,
+        tools: Sequence[Union[Dict[str, Any], Type[BaseModel], Callable, BaseTool]],
+        **kwargs: Any,
+    ) -> Runnable[LanguageModelInput, BaseMessage]:
+        formatted_tools = [convert_to_openai_tool(tool) for tool in tools]
+        return super().bind(tools=formatted_tools, **kwargs)
 
 
 class ChatOCIModelDeploymentVLLM(ChatOCIModelDeployment):
@@ -739,6 +765,19 @@ class ChatOCIModelDeploymentVLLM(ChatOCIModelDeployment):
     """Whether to add spaces between special tokens in the output.
     Defaults to True."""
 
+    tool_choice: Optional[str] = None
+    """Whether to use tool calling.
+    Defaults to None, tool calling is disabled.
+    Tool calling requires model support and vLLM to be configured with `--tool-call-parser`.
+    Set this to `auto` for the model to determine whether to make tool calls automatically.
+    Set this to `required` to force the model to always call one or more tools.
+    """
+
+    chat_template: Optional[str] = None
+    """Use customized chat template.
+    Defaults to None. The chat template from the tokenizer will be used.
+    """
+
     @property
     def _llm_type(self) -> str:
         """Return type of llm."""
@@ -785,6 +824,8 @@ class ChatOCIModelDeploymentVLLM(ChatOCIModelDeployment):
             "top_k",
             "top_p",
             "use_beam_search",
+            "tool_choice",
+            "chat_template",
         ]
 
 
